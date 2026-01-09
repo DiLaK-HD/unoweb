@@ -4,7 +4,7 @@ const next = require("next");
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = "localhost";
-const port = 3005;
+const port = process.env.PORT || 3005;
 
 const app = next({ dev, hostname, port });
 const handler = app.getRequestHandler();
@@ -61,7 +61,12 @@ function getCardImage(card) {
 }
 
 // Vérifier si une carte peut être jouée
-function canPlayCard(card, topCard, chosenColor) {
+function canPlayCard(card, topCard, chosenColor, pendingDraw) {
+  // Si on a des cartes à piocher en attente, on ne peut jouer que des +2 ou +4
+  if (pendingDraw > 0) {
+    return card.value === "plus2" || card.value === "plus4";
+  }
+  
   // Les cartes wild peuvent toujours être jouées
   if (card.color === "wild") return true;
   
@@ -83,11 +88,13 @@ function createGame(roomId, hostId, hostName) {
     deck: [],
     discardPile: [],
     currentPlayerIndex: 0,
-    direction: 1, // 1 = horaire, -1 = anti-horaire
+    direction: 1,
     chosenColor: null,
     started: false,
     winner: null,
-    cardsToDraw: 0, // Pour les +2 et +4 cumulés
+    pendingDraw: 0, // Cartes +2/+4 accumulées
+    mustDraw: false, // Le joueur doit piocher ou stacker
+    chat: [], // Historique du chat
   };
 }
 
@@ -103,17 +110,34 @@ function dealCards(game) {
     }));
   }
   
-  // Retourner la première carte (pas un wild)
+  // Retourner la première carte (pas un wild ni +2/+4)
   let firstCard;
   do {
     firstCard = game.deck.shift();
-    if (firstCard.color === "wild") {
+    if (firstCard.color === "wild" || firstCard.value === "plus2") {
       game.deck.push(firstCard);
     }
-  } while (firstCard.color === "wild");
+  } while (firstCard.color === "wild" || firstCard.value === "plus2");
   
   firstCard.image = getCardImage(firstCard);
   game.discardPile.push(firstCard);
+}
+
+// Réinitialiser la partie pour rejouer
+function resetGame(game) {
+  game.deck = [];
+  game.discardPile = [];
+  game.currentPlayerIndex = 0;
+  game.direction = 1;
+  game.chosenColor = null;
+  game.started = false;
+  game.winner = null;
+  game.pendingDraw = 0;
+  game.mustDraw = false;
+  
+  for (const player of game.players) {
+    player.cards = [];
+  }
 }
 
 // Piocher une carte
@@ -142,6 +166,11 @@ function nextPlayer(game) {
   game.currentPlayerIndex = (game.currentPlayerIndex + game.direction + game.players.length) % game.players.length;
 }
 
+// Vérifier si le joueur peut stacker (a un +2 ou +4)
+function canStack(player) {
+  return player.cards.some(card => card.value === "plus2" || card.value === "plus4");
+}
+
 app.prepare().then(() => {
   const httpServer = createServer(handler);
   const io = new Server(httpServer);
@@ -162,7 +191,8 @@ app.prepare().then(() => {
 
     // Rejoindre une partie
     socket.on("joinGame", ({ roomId, playerName }) => {
-      const game = games.get(roomId.toUpperCase());
+      const normalizedRoomId = roomId.toUpperCase();
+      const game = games.get(normalizedRoomId);
       
       if (!game) {
         socket.emit("error", { message: "Partie introuvable" });
@@ -174,20 +204,33 @@ app.prepare().then(() => {
         return;
       }
       
-      if (game.players.length >= 4) {
-        socket.emit("error", { message: "La partie est pleine (max 4 joueurs)" });
+      if (game.players.length >= 8) {
+        socket.emit("error", { message: "La partie est pleine (max 8 joueurs)" });
+        return;
+      }
+      
+      // Vérifier si le pseudo est déjà pris
+      if (game.players.some(p => p.name.toLowerCase() === playerName.toLowerCase())) {
+        socket.emit("error", { message: "Ce pseudo est déjà pris" });
         return;
       }
       
       game.players.push({ id: socket.id, name: playerName, cards: [], isHost: false });
-      socket.join(roomId.toUpperCase());
+      socket.join(normalizedRoomId);
+      
+      // Message système dans le chat
+      game.chat.push({
+        type: "system",
+        message: `${playerName} a rejoint la partie`,
+        timestamp: Date.now()
+      });
       
       // Notifier tous les joueurs
       for (const player of game.players) {
         io.to(player.id).emit("gameUpdated", sanitizeGameForPlayer(game, player.id));
       }
       
-      console.log(`${playerName} a rejoint la partie ${roomId}`);
+      console.log(`${playerName} a rejoint la partie ${normalizedRoomId}`);
     });
 
     // Démarrer la partie
@@ -210,12 +253,45 @@ app.prepare().then(() => {
       dealCards(game);
       game.started = true;
       
+      game.chat.push({
+        type: "system",
+        message: "La partie commence !",
+        timestamp: Date.now()
+      });
+      
       // Envoyer l'état à chaque joueur
       for (const p of game.players) {
         io.to(p.id).emit("gameStarted", sanitizeGameForPlayer(game, p.id));
       }
       
       console.log(`Partie ${roomId} démarrée!`);
+    });
+
+    // Rejouer une partie
+    socket.on("restartGame", ({ roomId }) => {
+      const game = games.get(roomId);
+      
+      if (!game) return;
+      
+      const player = game.players.find(p => p.id === socket.id);
+      if (!player?.isHost) {
+        socket.emit("error", { message: "Seul l'hôte peut relancer la partie" });
+        return;
+      }
+      
+      resetGame(game);
+      dealCards(game);
+      game.started = true;
+      
+      game.chat.push({
+        type: "system",
+        message: "Nouvelle partie !",
+        timestamp: Date.now()
+      });
+      
+      for (const p of game.players) {
+        io.to(p.id).emit("gameRestarted", sanitizeGameForPlayer(game, p.id));
+      }
     });
 
     // Jouer une carte
@@ -236,7 +312,7 @@ app.prepare().then(() => {
       const card = player.cards[cardIndex];
       const topCard = game.discardPile[game.discardPile.length - 1];
       
-      if (!canPlayCard(card, topCard, game.chosenColor)) {
+      if (!canPlayCard(card, topCard, game.chosenColor, game.pendingDraw)) {
         socket.emit("error", { message: "Tu ne peux pas jouer cette carte!" });
         return;
       }
@@ -247,27 +323,41 @@ app.prepare().then(() => {
       
       // Réinitialiser la couleur choisie
       game.chosenColor = null;
+      game.mustDraw = false;
       
       // Gérer les effets des cartes spéciales
       if (card.value === "plus2") {
-        game.cardsToDraw += 2;
-        nextPlayer(game);
-        const nextPlayerObj = game.players[game.currentPlayerIndex];
-        for (let i = 0; i < game.cardsToDraw; i++) {
-          drawCard(game, nextPlayerObj.id);
-        }
-        game.cardsToDraw = 0;
-        nextPlayer(game);
-      } else if (card.value === "plus4") {
+        game.pendingDraw += 2;
         if (chosenColor) game.chosenColor = chosenColor;
-        game.cardsToDraw += 4;
         nextPlayer(game);
+        
+        // Vérifier si le prochain joueur peut stacker
         const nextPlayerObj = game.players[game.currentPlayerIndex];
-        for (let i = 0; i < game.cardsToDraw; i++) {
-          drawCard(game, nextPlayerObj.id);
+        if (canStack(nextPlayerObj)) {
+          game.mustDraw = true; // Il doit choisir: stacker ou piocher
+        } else {
+          // Il doit piocher
+          for (let i = 0; i < game.pendingDraw; i++) {
+            drawCard(game, nextPlayerObj.id);
+          }
+          game.pendingDraw = 0;
+          nextPlayer(game);
         }
-        game.cardsToDraw = 0;
+      } else if (card.value === "plus4") {
+        game.pendingDraw += 4;
+        if (chosenColor) game.chosenColor = chosenColor;
         nextPlayer(game);
+        
+        const nextPlayerObj = game.players[game.currentPlayerIndex];
+        if (canStack(nextPlayerObj)) {
+          game.mustDraw = true;
+        } else {
+          for (let i = 0; i < game.pendingDraw; i++) {
+            drawCard(game, nextPlayerObj.id);
+          }
+          game.pendingDraw = 0;
+          nextPlayer(game);
+        }
       } else if (card.value === "change") {
         if (chosenColor) game.chosenColor = chosenColor;
         nextPlayer(game);
@@ -278,6 +368,11 @@ app.prepare().then(() => {
       // Vérifier la victoire
       if (player.cards.length === 0) {
         game.winner = player.name;
+        game.chat.push({
+          type: "system",
+          message: `🎉 ${player.name} a gagné la partie!`,
+          timestamp: Date.now()
+        });
       }
       
       // Notifier tous les joueurs
@@ -286,7 +381,30 @@ app.prepare().then(() => {
       }
     });
 
-    // Piocher une carte
+    // Piocher les cartes (accepter le stack)
+    socket.on("acceptDraw", ({ roomId }) => {
+      const game = games.get(roomId);
+      if (!game || !game.started || game.winner) return;
+      
+      const playerIndex = game.players.findIndex(p => p.id === socket.id);
+      if (playerIndex === -1 || playerIndex !== game.currentPlayerIndex) return;
+      
+      if (game.pendingDraw > 0) {
+        const player = game.players[playerIndex];
+        for (let i = 0; i < game.pendingDraw; i++) {
+          drawCard(game, player.id);
+        }
+        game.pendingDraw = 0;
+        game.mustDraw = false;
+        nextPlayer(game);
+        
+        for (const p of game.players) {
+          io.to(p.id).emit("gameUpdated", sanitizeGameForPlayer(game, p.id));
+        }
+      }
+    });
+
+    // Piocher une carte (tour normal)
     socket.on("drawCard", ({ roomId }) => {
       const game = games.get(roomId);
       if (!game || !game.started || game.winner) return;
@@ -297,10 +415,15 @@ app.prepare().then(() => {
         return;
       }
       
+      // Si on a des cartes en attente, utiliser acceptDraw
+      if (game.pendingDraw > 0) {
+        socket.emit("error", { message: "Utilise le bouton piocher pour prendre les cartes +" });
+        return;
+      }
+      
       drawCard(game, socket.id);
       nextPlayer(game);
       
-      // Notifier tous les joueurs
       for (const p of game.players) {
         io.to(p.id).emit("gameUpdated", sanitizeGameForPlayer(game, p.id));
       }
@@ -313,35 +436,73 @@ app.prepare().then(() => {
       
       const player = game.players.find(p => p.id === socket.id);
       if (player && player.cards.length === 1) {
+        game.chat.push({
+          type: "uno",
+          playerName: player.name,
+          message: `${player.name} a dit UNO!`,
+          timestamp: Date.now()
+        });
+        
         io.to(roomId).emit("playerSaidUno", { playerName: player.name });
+        
+        for (const p of game.players) {
+          io.to(p.id).emit("gameUpdated", sanitizeGameForPlayer(game, p.id));
+        }
       }
+    });
+
+    // Chat
+    socket.on("sendMessage", ({ roomId, message }) => {
+      const game = games.get(roomId);
+      if (!game) return;
+      
+      const player = game.players.find(p => p.id === socket.id);
+      if (!player) return;
+      
+      const chatMessage = {
+        type: "player",
+        playerName: player.name,
+        message: message.substring(0, 200), // Limite 200 caractères
+        timestamp: Date.now()
+      };
+      
+      game.chat.push(chatMessage);
+      
+      // Garder seulement les 50 derniers messages
+      if (game.chat.length > 50) {
+        game.chat = game.chat.slice(-50);
+      }
+      
+      io.to(roomId).emit("newMessage", chatMessage);
     });
 
     // Déconnexion
     socket.on("disconnect", () => {
       console.log("Joueur déconnecté:", socket.id);
       
-      // Nettoyer les parties où le joueur était
       for (const [roomId, game] of games.entries()) {
         const playerIndex = game.players.findIndex(p => p.id === socket.id);
         if (playerIndex !== -1) {
           const player = game.players[playerIndex];
           game.players.splice(playerIndex, 1);
           
+          game.chat.push({
+            type: "system",
+            message: `${player.name} a quitté la partie`,
+            timestamp: Date.now()
+          });
+          
           if (game.players.length === 0) {
             games.delete(roomId);
           } else {
-            // Si l'hôte part, donner le rôle au suivant
             if (player.isHost && game.players.length > 0) {
               game.players[0].isHost = true;
             }
             
-            // Ajuster l'index du joueur actuel
             if (game.started && game.currentPlayerIndex >= game.players.length) {
               game.currentPlayerIndex = 0;
             }
             
-            // Notifier les autres
             for (const p of game.players) {
               io.to(p.id).emit("playerLeft", { 
                 playerName: player.name,
@@ -354,8 +515,10 @@ app.prepare().then(() => {
     });
   });
 
-  // Nettoyer les données sensibles pour chaque joueur
   function sanitizeGameForPlayer(game, playerId) {
+    const currentPlayer = game.players[game.currentPlayerIndex];
+    const myPlayer = game.players.find(p => p.id === playerId);
+    
     return {
       roomId: game.roomId,
       players: game.players.map(p => ({
@@ -364,16 +527,20 @@ app.prepare().then(() => {
         cardCount: p.cards.length,
         cards: p.id === playerId ? p.cards : [],
         isHost: p.isHost,
-        isCurrentPlayer: game.players[game.currentPlayerIndex]?.id === p.id
+        isCurrentPlayer: currentPlayer?.id === p.id
       })),
       topCard: game.discardPile[game.discardPile.length - 1],
       deckCount: game.deck.length,
-      currentPlayerId: game.players[game.currentPlayerIndex]?.id,
+      currentPlayerId: currentPlayer?.id,
       chosenColor: game.chosenColor,
       started: game.started,
       winner: game.winner,
-      myCards: game.players.find(p => p.id === playerId)?.cards || [],
-      isMyTurn: game.players[game.currentPlayerIndex]?.id === playerId
+      myCards: myPlayer?.cards || [],
+      isMyTurn: currentPlayer?.id === playerId,
+      pendingDraw: game.pendingDraw,
+      mustDraw: game.mustDraw,
+      canStack: myPlayer ? canStack(myPlayer) : false,
+      chat: game.chat.slice(-20), // Derniers 20 messages
     };
   }
 
